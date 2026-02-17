@@ -23,7 +23,6 @@ ALLOWED_ORIGINS = [
 print("="*50)
 print("="*50)
 print(f"📋 Allowed Origins: {ALLOWED_ORIGINS}")
-print(f"📂 Current Directory: {os.getcwd()}")
 print(f"📂 Files in directory: {os.listdir()}")
 
 # CORS Middleware
