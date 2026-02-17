@@ -2,7 +2,8 @@ import traceback
 import joblib
 import pandas as pd
 import sys
-from fastapi import FastAPI, UploadFile, File, Request, Response
+import os
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -19,28 +20,76 @@ ALLOWED_ORIGINS = [
     "https://barclays-assignment.onrender.com",
 ]
 
-print(f"🚀 CORS Allowed Origins: {ALLOWED_ORIGINS}")
+print("="*50)
+print("🚀 Starting Pre-delinquency API")
+print("="*50)
+print(f"📋 Allowed Origins: {ALLOWED_ORIGINS}")
+print(f"📂 Current Directory: {os.getcwd()}")
+print(f"📂 Files in directory: {os.listdir()}")
 
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
     allow_headers=["*"],
     expose_headers=["*"],
+    max_age=3600,
 )
 
+# Add middleware to ensure CORS headers on all responses
+@app.middleware("http")
+async def add_cors_header(request: Request, call_next):
+    response = await call_next(request)
+
+    # Get the origin from the request
+    origin = request.headers.get("origin")
+
+    # If the origin is allowed, add CORS headers
+    if origin in ALLOWED_ORIGINS or (origin and ("netlify.app" in origin or "localhost" in origin)):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, Accept, Origin"
+        response.headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Type"
+
+    return response
+
+# Handle OPTIONS requests explicitly
+@app.options("/{path:path}")
+async def options_handler(request: Request, path: str):
+    origin = request.headers.get("origin")
+
+    if origin in ALLOWED_ORIGINS or (origin and ("netlify.app" in origin or "localhost" in origin)):
+        headers = {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, Accept, Origin",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Max-Age": "3600",
+            "Access-Control-Expose-Headers": "Content-Length, Content-Type",
+        }
+        return JSONResponse(content={}, status_code=200, headers=headers)
+
+    return JSONResponse(content={"error": "Origin not allowed"}, status_code=400)
+
 # ---------------- MODEL LOADING ----------------
+MODEL_PATH = "pre_delinquency_model.pkl"
+print(f"🔍 Looking for model at: {MODEL_PATH}")
+print(f"🔍 Model exists: {os.path.exists(MODEL_PATH)}")
+
 try:
-    model = joblib.load("pre_delinquency_model.pkl")
+    model = joblib.load(MODEL_PATH)
     print("✅ Model loaded successfully!")
-except Exception:
+    print(f"📊 Model type: {type(model)}")
+except Exception as e:
     print("❌ Model failed to load")
+    print(f"❌ Error: {str(e)}")
     print(traceback.format_exc())
     model = None
 
-# ---------------- DEBUG ENDPOINTS ----------------
+# ---------------- TEST ENDPOINTS ----------------
 @app.get("/")
 async def root():
     """Root endpoint"""
@@ -48,17 +97,33 @@ async def root():
         "message": "Pre-delinquency API",
         "status": "running",
         "model_loaded": model is not None,
-        "cors_origins": ALLOWED_ORIGINS
+        "cors_origins": ALLOWED_ORIGINS,
+        "environment": os.getenv("ENVIRONMENT", "production")
     }
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
     """Health check endpoint"""
+    origin = request.headers.get("origin")
     return {
         "status": "healthy",
         "model_loaded": model is not None,
         "cors_configured": True,
-        "allowed_origins": ALLOWED_ORIGINS
+        "allowed_origins": ALLOWED_ORIGINS,
+        "request_origin": origin,
+        "python_version": sys.version
+    }
+
+@app.get("/test")
+async def test_cors(request: Request):
+    """Test CORS endpoint"""
+    origin = request.headers.get("origin")
+    return {
+        "message": "CORS is working!",
+        "origin": origin,
+        "allowed_origins": ALLOWED_ORIGINS,
+        "headers": dict(request.headers),
+        "method": request.method
     }
 
 @app.get("/debug")
@@ -72,7 +137,9 @@ async def debug(request: Request):
         "url": str(request.url),
         "model_loaded": model is not None,
         "python_version": sys.version,
-        "cors_origins": ALLOWED_ORIGINS
+        "cors_origins": ALLOWED_ORIGINS,
+        "cwd": os.getcwd(),
+        "files": os.listdir()
     }
 
 # ---------------- INPUT SCHEMA ----------------
@@ -103,12 +170,16 @@ class CustomerData(BaseModel):
 
 # ---------------- FEATURE ENGINEERING ----------------
 def compute_prediction(input_df: pd.DataFrame):
+    """
+    Compute risk prediction from input features
+    """
     df = input_df.copy()
 
     pay_cols = ["pay_0", "pay_2", "pay_3", "pay_4", "pay_5", "pay_6"]
     bill_cols = ["bill_amt1", "bill_amt2", "bill_amt3", "bill_amt4", "bill_amt5", "bill_amt6"]
     pay_amt_cols = ["pay_amt1", "pay_amt2", "pay_amt3", "pay_amt4", "pay_amt5", "pay_amt6"]
 
+    # Feature engineering
     df["avg_delay"] = df[pay_cols].mean(axis=1)
     df["delay_trend"] = df["pay_6"] - df["pay_0"]
     df["bill_growth"] = (df["bill_amt6"] - df["bill_amt1"]) / (df["bill_amt1"] + 1)
@@ -136,6 +207,10 @@ def compute_prediction(input_df: pd.DataFrame):
     ]
 
     X = df[feature_order]
+
+    if model is None:
+        raise Exception("Model not loaded")
+
     risk_score = float(model.predict_proba(X)[0][1])
 
     if risk_score < 0.3:
@@ -155,27 +230,50 @@ def compute_prediction(input_df: pd.DataFrame):
 
 # ---------------- API ENDPOINTS ----------------
 @app.post("/predict")
-def predict(data: CustomerData):
+async def predict(data: CustomerData, request: Request):
+    """Single customer prediction endpoint"""
     if model is None:
-        return {"error": "Model not loaded"}
+        return JSONResponse(
+            content={"error": "Model not loaded"},
+            status_code=503
+        )
 
     try:
         input_df = pd.DataFrame([data.dict()])
         risk_score, level, action, reason = compute_prediction(input_df)
-        return {
+
+        result = {
             "risk_score": risk_score,
             "risk_level": level,
             "recommended_action": action,
             "reason": reason
         }
+
+        # Create response with CORS headers
+        origin = request.headers.get("origin")
+        response = JSONResponse(content=result)
+
+        if origin in ALLOWED_ORIGINS or (origin and ("netlify.app" in origin or "localhost" in origin)):
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+
+        return response
+
     except Exception as e:
         print(traceback.format_exc())
-        return {"error": str(e)}
+        return JSONResponse(
+            content={"error": str(e)},
+            status_code=500
+        )
 
 @app.post("/predict_csv")
-async def predict_csv(file: UploadFile = File(...)):
+async def predict_csv(file: UploadFile = File(...), request: Request):
+    """Batch prediction from CSV file"""
     if model is None:
-        return {"error": "Model not loaded"}
+        return JSONResponse(
+            content={"error": "Model not loaded"},
+            status_code=503
+        )
 
     try:
         df = pd.read_csv(file.file)
@@ -201,11 +299,17 @@ async def predict_csv(file: UploadFile = File(...)):
         )
     except Exception as e:
         print(traceback.format_exc())
-        return {"error": str(e)}
+        return JSONResponse(
+            content={"error": str(e)},
+            status_code=500
+        )
 
 @app.get("/dashboard-metrics")
-def dashboard_metrics():
-    return {
+async def dashboard_metrics(request: Request):
+    """Dashboard metrics endpoint"""
+    print("📊 Dashboard metrics requested")
+
+    data = {
         "portfolioMetrics": {
             "totalAccounts": 12500,
             "atRiskAccounts": 1840,
@@ -234,9 +338,24 @@ def dashboard_metrics():
         ]
     }
 
+    # Create response with CORS headers
+    origin = request.headers.get("origin")
+    response = JSONResponse(content=data)
+
+    if origin in ALLOWED_ORIGINS or (origin and ("netlify.app" in origin or "localhost" in origin)):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        print(f"✅ Added CORS headers for origin: {origin}")
+    else:
+        print(f"⚠️ Origin not allowed: {origin}")
+
+    return response
+
 @app.get("/customers")
-def get_customers():
+async def get_customers(request: Request):
+    """Get customers with risk scores"""
     print("🚨 /customers HIT")
+    print(f"📨 Request origin: {request.headers.get('origin')}")
 
     raw_customers = [
         {
@@ -270,7 +389,6 @@ def get_customers():
     ]
 
     customers = []
-
     for c in raw_customers:
         try:
             model_input = {
@@ -283,12 +401,11 @@ def get_customers():
                     "pay_amt4", "pay_amt5", "pay_amt6",
                 ]
             }
-
             df = pd.DataFrame([model_input])
             risk_score, level, _, _ = compute_prediction(df)
-
+            print(f"✅ Prediction successful for customer {c['id']}: {risk_score}")
         except Exception as e:
-            print("❌ ML FAILED:", e)
+            print(f"❌ ML FAILED for customer {c['id']}: {e}")
             risk_score = 0.5
             level = "MEDIUM RISK"
 
@@ -298,7 +415,7 @@ def get_customers():
             "accountNumber": c["accountNumber"],
             "riskScore": round(risk_score, 2),
             "riskBucket": level.replace(" RISK", ""),
-            "utilizationRate": c["bill_amt6"] / c["limit_bal"],
+            "utilizationRate": round(c["bill_amt6"] / c["limit_bal"], 2),
             "currentBalance": c["bill_amt6"],
             "creditLimit": c["limit_bal"],
             "averagePaymentDelay": int(
@@ -310,4 +427,23 @@ def get_customers():
             "behaviorFlags": ["Late payment history"]
         })
 
-    return customers
+    # Create response with CORS headers
+    origin = request.headers.get("origin")
+    response = JSONResponse(content=customers)
+
+    if origin in ALLOWED_ORIGINS or (origin and ("netlify.app" in origin or "localhost" in origin)):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        print(f"✅ Added CORS headers for origin: {origin}")
+    else:
+        print(f"⚠️ Origin not allowed: {origin}")
+
+    print(f"📊 Returning {len(customers)} customers")
+    return response
+
+# Run the application
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    print(f"🚀 Starting server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
