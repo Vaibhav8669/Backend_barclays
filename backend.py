@@ -1,56 +1,99 @@
 import traceback
 import joblib
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File
+import sys
+from fastapi import FastAPI, UploadFile, File, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 app = FastAPI()
 
+# Define allowed origins
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://barclaysassignment.netlify.app",
+    "https://barclays-assignment.onrender.com",
+]
+
+print(f"🚀 CORS Allowed Origins: {ALLOWED_ORIGINS}")
+
+# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins (use only for testing!)
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
-
 # ---------------- MODEL LOADING ----------------
-
 try:
     model = joblib.load("pre_delinquency_model.pkl")
-    print("Model loaded successfully!")
+    print("✅ Model loaded successfully!")
 except Exception:
-    print("Model failed to load")
+    print("❌ Model failed to load")
     print(traceback.format_exc())
     model = None
 
+# ---------------- DEBUG ENDPOINTS ----------------
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "Pre-delinquency API",
+        "status": "running",
+        "model_loaded": model is not None,
+        "cors_origins": ALLOWED_ORIGINS
+    }
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "cors_configured": True,
+        "allowed_origins": ALLOWED_ORIGINS
+    }
+
+@app.get("/debug")
+async def debug(request: Request):
+    """Debug endpoint"""
+    return {
+        "client_host": request.client.host if request.client else "unknown",
+        "origin": request.headers.get("origin"),
+        "headers": dict(request.headers),
+        "method": request.method,
+        "url": str(request.url),
+        "model_loaded": model is not None,
+        "python_version": sys.version,
+        "cors_origins": ALLOWED_ORIGINS
+    }
 
 # ---------------- INPUT SCHEMA ----------------
-
 class CustomerData(BaseModel):
     limit_bal: float
     sex: int
     education: int
     marriage: int
     age: int
-
     pay_0: int
     pay_2: int
     pay_3: int
     pay_4: int
     pay_5: int
     pay_6: int
-
     bill_amt1: float
     bill_amt2: float
     bill_amt3: float
     bill_amt4: float
     bill_amt5: float
     bill_amt6: float
-
     pay_amt1: float
     pay_amt2: float
     pay_amt3: float
@@ -58,11 +101,8 @@ class CustomerData(BaseModel):
     pay_amt5: float
     pay_amt6: float
 
-
 # ---------------- FEATURE ENGINEERING ----------------
-
 def compute_prediction(input_df: pd.DataFrame):
-
     df = input_df.copy()
 
     pay_cols = ["pay_0", "pay_2", "pay_3", "pay_4", "pay_5", "pay_6"]
@@ -71,19 +111,15 @@ def compute_prediction(input_df: pd.DataFrame):
 
     df["avg_delay"] = df[pay_cols].mean(axis=1)
     df["delay_trend"] = df["pay_6"] - df["pay_0"]
-
     df["bill_growth"] = (df["bill_amt6"] - df["bill_amt1"]) / (df["bill_amt1"] + 1)
-
     df["utilization_avg"] = df[bill_cols].mean(axis=1) / (df["limit_bal"] + 1)
-
     df["pay_cover_ratio_avg"] = (
-        df[pay_amt_cols].mean(axis=1) /
-        (df[bill_cols].mean(axis=1) + 1)
+            df[pay_amt_cols].mean(axis=1) /
+            (df[bill_cols].mean(axis=1) + 1)
     )
-
     df["cash_flow_proxy"] = df[pay_amt_cols].mean(axis=1)
 
-    # One-hot encoding (MATCH TRAINING FEATURES)
+    # One-hot encoding
     df["sex_2"] = (df["sex"] == 2).astype(int)
 
     for i in range(1, 7):
@@ -93,28 +129,13 @@ def compute_prediction(input_df: pd.DataFrame):
         df[f"marriage_{i}"] = (df["marriage"] == i).astype(int)
 
     feature_order = [
-        "limit_bal",
-        "age",
-        "avg_delay",
-        "delay_trend",
-        "pay_cover_ratio_avg",
-        "bill_growth",
-        "utilization_avg",
-        "cash_flow_proxy",
-        "sex_2",
-        "education_1",
-        "education_2",
-        "education_3",
-        "education_4",
-        "education_5",
-        "education_6",
-        "marriage_1",
-        "marriage_2",
-        "marriage_3",
+        "limit_bal", "age", "avg_delay", "delay_trend", "pay_cover_ratio_avg",
+        "bill_growth", "utilization_avg", "cash_flow_proxy", "sex_2",
+        "education_1", "education_2", "education_3", "education_4",
+        "education_5", "education_6", "marriage_1", "marriage_2", "marriage_3",
     ]
 
     X = df[feature_order]
-
     risk_score = float(model.predict_proba(X)[0][1])
 
     if risk_score < 0.3:
@@ -132,51 +153,38 @@ def compute_prediction(input_df: pd.DataFrame):
 
     return risk_score, level, action, reason
 
-
-# ---------------- SINGLE PREDICTION ----------------
-
+# ---------------- API ENDPOINTS ----------------
 @app.post("/predict")
 def predict(data: CustomerData):
-
     if model is None:
         return {"error": "Model not loaded"}
 
     try:
         input_df = pd.DataFrame([data.dict()])
-
         risk_score, level, action, reason = compute_prediction(input_df)
-
         return {
             "risk_score": risk_score,
             "risk_level": level,
             "recommended_action": action,
             "reason": reason
         }
-
     except Exception as e:
         print(traceback.format_exc())
         return {"error": str(e)}
 
-
-# ---------------- CSV BATCH PREDICTION ----------------
-
 @app.post("/predict_csv")
 async def predict_csv(file: UploadFile = File(...)):
-
     if model is None:
         return {"error": "Model not loaded"}
 
     try:
         df = pd.read_csv(file.file)
-
         risk_scores = []
         risk_levels = []
 
         for _, row in df.iterrows():
             row_df = pd.DataFrame([row])
-
             risk_score, level, _, _ = compute_prediction(row_df)
-
             risk_scores.append(risk_score)
             risk_levels.append(level)
 
@@ -191,19 +199,12 @@ async def predict_csv(file: UploadFile = File(...)):
             media_type="text/csv",
             filename="predictions.csv"
         )
-
     except Exception as e:
         print(traceback.format_exc())
         return {"error": str(e)}
 
-
 @app.get("/dashboard-metrics")
 def dashboard_metrics():
-    """
-    In real life this would come from DB.
-    For now, mock-but-realistic server-side aggregation.
-    """
-
     return {
         "portfolioMetrics": {
             "totalAccounts": 12500,
@@ -242,28 +243,23 @@ def get_customers():
             "id": 1,
             "name": "Rohan Sharma",
             "accountNumber": "ACC-10021",
-
-            # RAW INPUTS (same schema as /predict)
             "limit_bal": 200000,
             "sex": 2,
             "education": 2,
             "marriage": 1,
             "age": 35,
-
             "pay_0": 0,
             "pay_2": 0,
             "pay_3": 1,
             "pay_4": 0,
             "pay_5": 0,
             "pay_6": 0,
-
             "bill_amt1": 50000,
             "bill_amt2": 48000,
             "bill_amt3": 47000,
             "bill_amt4": 46000,
             "bill_amt5": 45000,
             "bill_amt6": 44000,
-
             "pay_amt1": 5000,
             "pay_amt2": 6000,
             "pay_amt3": 7000,
@@ -277,7 +273,6 @@ def get_customers():
 
     for c in raw_customers:
         try:
-            # ✅ ONLY pass model input fields
             model_input = {
                 k: c[k] for k in [
                     "limit_bal", "sex", "education", "marriage", "age",
@@ -290,14 +285,9 @@ def get_customers():
             }
 
             df = pd.DataFrame([model_input])
-
-            # 🔍 Debug: PROVE feature alignment
-            print("📊 Input columns:", df.columns.tolist())
-
             risk_score, level, _, _ = compute_prediction(df)
 
         except Exception as e:
-            # 🛡 Never crash endpoint
             print("❌ ML FAILED:", e)
             risk_score = 0.5
             level = "MEDIUM RISK"
