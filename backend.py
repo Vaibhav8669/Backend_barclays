@@ -21,7 +21,6 @@ ALLOWED_ORIGINS = [
 ]
 
 print("="*50)
-print("🚀 Starting Pre-delinquency API")
 print("="*50)
 print(f"📋 Allowed Origins: {ALLOWED_ORIGINS}")
 print(f"📂 Current Directory: {os.getcwd()}")
